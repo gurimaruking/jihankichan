@@ -1,0 +1,18 @@
+# パスワード入りSSH/デプロイスクリプト
+ssh_*.py
+deploy_*.py
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Claude Code
+.claude/
+
+# 一時ファイル
+_ul
+*.tmp
+
+# 録画データ
+recordings/
