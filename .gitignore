@@ -16,3 +16,13 @@ _ul
 
 # 録画データ
 recordings/
+
+# 秘密情報 (Discord Webhook URL など。公開リポジトリのためコミットしない)
+discord_webhook.txt
+
+# 作業用の退避・診断ファイル
+*.bak
+*.bak_*
+snapshot.jpg
+_*.py
+jihankichan_Photo/Suiicho.jpg
