@@ -177,7 +177,7 @@ camera_index = 0
 
 # 録画設定
 RECORDING_DIR = os.path.join(os.path.expanduser("~"), "stackchan_recordings")
-RETENTION_DAYS = int(os.environ.get("JIHANKICHAN_RETENTION_DAYS", "3"))
+RETENTION_DAYS = int(os.environ.get("JIHANKICHAN_RETENTION_DAYS", "1"))   # 常時録画の保持日数(防犯用: 1日分)
 # 空き容量がこれを下回ったら古い録画から消す（GB）。復帰目標は MIN_FREE_GB + 2
 MIN_FREE_GB = float(os.environ.get("JIHANKICHAN_MIN_FREE_GB", "4"))
 SEGMENT_MINUTES = 10
@@ -258,6 +258,18 @@ STATIC_WINDOW_SEC = int(os.environ.get("JIHANKICHAN_STATIC_WINDOW_SEC", "86400")
 GREETING_FACE_MIN_SIZE = int(os.environ.get("JIHANKICHAN_GREETING_FACE_MIN_SIZE", "40"))
 # 録画は N フレームに1回だけ書く（15fps化でディスクが倍増するのを防ぐ。writer fpsも連動）
 RECORD_EVERY_N_FRAMES = max(1, int(os.environ.get("JIHANKICHAN_RECORD_EVERY_N", "4")))  # 2026-09-28: 実効25fps化で録画が倍増したため 2→4（約6fps、~4.5GB/3日）
+
+# ---- 来訪者クリップ(前後N秒を動画化して Discord へ) ----
+CLIP_ENABLED = os.environ.get("JIHANKICHAN_CLIP_ENABLED", "1") not in ("0", "false", "False")
+CLIP_PRE_SEC = float(os.environ.get("JIHANKICHAN_CLIP_PRE_SEC", "30"))
+CLIP_POST_SEC = float(os.environ.get("JIHANKICHAN_CLIP_POST_SEC", "30"))
+CLIP_MAX_SEC = float(os.environ.get("JIHANKICHAN_CLIP_MAX_SEC", "150"))      # 重なる来訪を1本にまとめる最長(検知起点から)
+CLIP_FPS = float(os.environ.get("JIHANKICHAN_CLIP_FPS", "5"))
+CLIP_JPEG_Q = int(os.environ.get("JIHANKICHAN_CLIP_JPEG_Q", "72"))
+CLIP_MAX_UPLOAD_BYTES = int(float(os.environ.get("JIHANKICHAN_CLIP_MAX_UPLOAD_MB", "9.5")) * 1e6)   # Discord の上限(10MB)未満
+CLIP_KEEP_DAYS = int(os.environ.get("JIHANKICHAN_CLIP_KEEP_DAYS", "3"))
+CLIP_DIR = os.path.join(os.path.expanduser("~"), "stackchan_clips")
+CLIP_TEST_FLAG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "clip_test.flag")
 
 # 顔検出に使う縮小率（0.5 = 320x240で検出 → 約4倍速。座標は元解像度に戻す）
 DETECT_SCALE = float(os.environ.get("JIHANKICHAN_DETECT_SCALE", "0.4"))
@@ -1310,6 +1322,211 @@ def _save_visit_snapshot(frame, track, kind):
         logger.debug(f"visit snapshot failed: {e}")
 
 
+import collections as _collections
+import queue as _queue
+import subprocess as _subprocess
+
+
+class ClipRecorder:
+    """来訪者の検知を中心に、前 CLIP_PRE_SEC 秒 + 後 CLIP_POST_SEC 秒を1本の動画にして Discord へ送る。
+
+    - 直近フレームを JPEG でメモリ(約6MB)に保持 → 録画ファイルのシークに頼らず前30秒を確保
+    - 後30秒の間に別の来訪があれば、後ろを延長して1本にまとめる (最長 CLIP_MAX_SEC)
+    - 変換(ffmpeg/H.264)と送信は専用スレッド・低優先度。検出や挨拶は止めない
+    """
+
+    def __init__(self):
+        self.ring = _collections.deque()          # (time, jpeg_bytes)
+        self.active = None                        # 進行中のイベント
+        self._lock = threading.Lock()
+        self._q = _queue.Queue()
+        self._last_push = 0.0
+        self._last_flag = 0.0
+        self._ffmpeg_exe = False                  # False=未探索 / None=無し
+        HEALTH.setdefault("clips_sent", 0)
+        HEALTH.setdefault("clips_failed", 0)
+        if CLIP_ENABLED:
+            threading.Thread(target=self._worker, daemon=True, name="clip-worker").start()
+
+    # ---- カメラスレッドから (毎フレーム呼んでよい。内部で CLIP_FPS に間引く) ----
+    def push(self, frame):
+        if not CLIP_ENABLED:
+            return
+        now = time.time()
+        if now - self._last_push < 0.85 / CLIP_FPS:    # デコード間隔(約83ms)に合わせ、目標fpsに近づける
+            return
+        self._last_push = now
+        ok, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, CLIP_JPEG_Q])
+        if not ok:
+            return
+        item = (now, buf.tobytes())
+        done = None
+        with self._lock:
+            self.ring.append(item)
+            while self.ring and now - self.ring[0][0] > CLIP_PRE_SEC:
+                self.ring.popleft()
+            if self.active is not None:
+                self.active['frames'].append(item)
+                if now >= self.active['end'] or now - self.active['t0'] >= CLIP_MAX_SEC:
+                    done, self.active = self.active, None
+        if done is not None:
+            self._q.put(done)
+        if now - self._last_flag > 5.0:        # 動作確認用: C:\stackchan\clip_test.flag を置くと1本作る
+            self._last_flag = now
+            self._check_flag()
+
+    def _check_flag(self):
+        try:
+            if os.path.isfile(CLIP_TEST_FLAG):
+                with open(CLIP_TEST_FLAG, 'r', encoding='utf-8', errors='replace') as f:
+                    mode = f.read().strip().lower()
+                os.remove(CLIP_TEST_FLAG)
+                logger.info(f"Clip test flag found (mode={mode or 'upload'})")
+                self.trigger("manual test", upload=(mode != "noupload"))
+        except Exception as e:
+            logger.warning(f"clip test flag error: {e}")
+
+    # ---- 来訪の検知から ----
+    def trigger(self, note, upload=True):
+        if not CLIP_ENABLED:
+            return None
+        now = time.time()
+        with self._lock:
+            if self.active is not None:
+                self.active['end'] = now + CLIP_POST_SEC       # 重なる検知は1本にまとめる
+                self.active['notes'].append(note)
+                self.active['upload'] = self.active['upload'] or upload
+                return "extended"
+            self.active = {'t0': now, 'end': now + CLIP_POST_SEC, 'frames': list(self.ring),
+                           'notes': [note], 'upload': upload}
+            return "started"
+
+    # ---- 変換・送信 (専用スレッド) ----
+    def _worker(self):
+        while True:
+            ev = self._q.get()
+            try:
+                self._make_and_send(ev)
+            except Exception as e:
+                HEALTH["clips_failed"] = HEALTH.get("clips_failed", 0) + 1
+                logger.error(f"clip error: {e}")
+
+    def _find_ffmpeg(self):
+        if self._ffmpeg_exe is not False:
+            return self._ffmpeg_exe
+        exe = None
+        try:
+            import imageio_ffmpeg
+            exe = imageio_ffmpeg.get_ffmpeg_exe()
+        except Exception:
+            import shutil
+            exe = shutil.which("ffmpeg")
+        self._ffmpeg_exe = exe
+        logger.info(f"Clip encoder: {'ffmpeg ' + str(exe) if exe else 'NOT found (fallback mp4v)'}")
+        return exe
+
+    def _encode_ffmpeg(self, frames, fps, path, crf, width=None):
+        exe = self._find_ffmpeg()
+        if not exe:
+            return False
+        cmd = [exe, '-y', '-loglevel', 'error', '-f', 'image2pipe', '-framerate', f'{fps:.3f}', '-c:v', 'mjpeg', '-i', '-']
+        if width:
+            cmd += ['-vf', f'scale={width}:-2']
+        cmd += ['-c:v', 'libx264', '-preset', 'ultrafast', '-crf', str(crf), '-pix_fmt', 'yuv420p',
+                '-movflags', '+faststart', path]
+        # CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS: 検出/TTS を邪魔しない
+        p = _subprocess.Popen(cmd, stdin=_subprocess.PIPE, stdout=_subprocess.DEVNULL,
+                              stderr=_subprocess.DEVNULL, creationflags=0x08000000 | 0x00004000)
+        try:
+            for _, jpg in frames:
+                p.stdin.write(jpg)
+            p.stdin.close()
+            p.wait(timeout=600)
+        except Exception as e:
+            logger.warning(f"ffmpeg pipe error: {e}")
+            try:
+                p.kill()
+            except Exception:
+                pass
+            return False
+        return p.returncode == 0 and os.path.isfile(path) and os.path.getsize(path) > 1000
+
+    def _encode_cv2(self, frames, fps, path):
+        """ffmpeg が無い時の保険 (mp4v: Discord上でプレビューできない場合がある)"""
+        first = cv2.imdecode(np.frombuffer(frames[0][1], np.uint8), cv2.IMREAD_COLOR)
+        h, w = first.shape[:2]
+        vw = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (w, h))
+        for _, jpg in frames:
+            vw.write(cv2.imdecode(np.frombuffer(jpg, np.uint8), cv2.IMREAD_COLOR))
+        vw.release()
+        return os.path.isfile(path) and os.path.getsize(path) > 1000
+
+    def _make_and_send(self, ev):
+        frames = ev['frames']
+        if len(frames) < 5:
+            logger.info("clip skipped: too few frames")
+            return
+        dur = max(1.0, frames[-1][0] - frames[0][0])
+        fps = min(max(len(frames) / dur, 1.0), 15.0)
+        os.makedirs(CLIP_DIR, exist_ok=True)
+        stamp = datetime.fromtimestamp(ev['t0'])
+        path = os.path.join(CLIP_DIR, stamp.strftime("clip_%Y%m%d_%H%M%S.mp4"))
+        t0 = time.time()
+        ok = self._encode_ffmpeg(frames, fps, path, crf=30)
+        if ok and os.path.getsize(path) > CLIP_MAX_UPLOAD_BYTES:
+            logger.info(f"clip too large ({os.path.getsize(path) / 1e6:.1f}MB) - re-encoding smaller")
+            ok = self._encode_ffmpeg(frames, fps, path, crf=36, width=480)
+        if not ok:
+            ok = self._encode_cv2(frames, fps, path)
+        if not ok:
+            HEALTH["clips_failed"] = HEALTH.get("clips_failed", 0) + 1
+            logger.error("clip encode failed")
+            return
+        size = os.path.getsize(path)
+        logger.info(f"Clip saved: {os.path.basename(path)} {size / 1e6:.1f}MB, {dur:.0f}s, {len(frames)} frames, "
+                    f"encode {time.time() - t0:.0f}s, events={len(ev['notes'])}, upload={ev['upload']}")
+        self._cleanup()
+        if not ev['upload']:
+            return
+        if size > CLIP_MAX_UPLOAD_BYTES:
+            logger.warning(f"clip not uploaded: {size / 1e6:.1f}MB exceeds {CLIP_MAX_UPLOAD_BYTES / 1e6:.1f}MB")
+            HEALTH["clips_failed"] = HEALTH.get("clips_failed", 0) + 1
+            return
+        self._upload(path, stamp, dur, len(ev['notes']))
+
+    def _upload(self, path, stamp, dur, n_events):
+        if not REQUESTS_AVAILABLE or not DISCORD_WEBHOOK_URL:
+            return
+        extra = f"（{n_events}件の来訪を1本にまとめました）" if n_events > 1 else ""
+        content = f"🎥 来訪者クリップ 前後{CLIP_PRE_SEC}秒{extra}\n🕐 {stamp.strftime('%Y-%m-%d %H:%M:%S')}（{dur:.0f}秒）"
+        try:
+            with open(path, 'rb') as f:
+                r = requests.post(DISCORD_WEBHOOK_URL, data={'content': content},
+                                  files={'file': (os.path.basename(path), f, 'video/mp4')}, timeout=180)
+            if r.status_code in (200, 204):
+                HEALTH["clips_sent"] = HEALTH.get("clips_sent", 0) + 1
+                logger.info(f"Clip uploaded to Discord (HTTP {r.status_code})")
+            else:
+                HEALTH["clips_failed"] = HEALTH.get("clips_failed", 0) + 1
+                logger.warning(f"Clip upload failed: HTTP {r.status_code} {r.text[:160]}")
+        except Exception as e:
+            HEALTH["clips_failed"] = HEALTH.get("clips_failed", 0) + 1
+            logger.error(f"Clip upload error: {e}")
+
+    def _cleanup(self):
+        try:
+            cutoff = time.time() - CLIP_KEEP_DAYS * 86400
+            for n in os.listdir(CLIP_DIR):
+                p = os.path.join(CLIP_DIR, n)
+                if n.endswith('.mp4') and os.path.getmtime(p) < cutoff:
+                    os.remove(p)
+        except Exception:
+            pass
+
+
+CLIPS = ClipRecorder()
+
+
 class FaceDetector:
     """お客さん検出: 動き検出ゲート → 動き周辺の高解像度顔検出 → トラッキング → 挨拶/カウント/通知"""
 
@@ -1560,6 +1777,7 @@ class FaceDetector:
             if t['confirmed'] and not t['engaged'] and (self._is_lingering(t, now) or (t['max_size'] >= ENGAGE_SIZE and t['hits'] >= 4)):
                 t['engaged'] = True
                 VISITS.add("visitor", t['max_size'], mean_conf, span)
+                CLIPS.trigger(f"visitor track#{t['id']} {t['max_size']}px {span:.0f}s")
                 bf = t.get('best_frame')
                 if bf is not None:
                     bt = dict(t); bt['box'] = t.get('best_box', t['box']); bt['conf'] = t.get('best_conf', t['conf'])
@@ -2004,6 +2222,9 @@ def health():
         'visitors_today': HEALTH['visitors_today'],
         'tracks': HEALTH['tracks'],
         'motion_cells': HEALTH['motion_cells'],
+        'clips_sent': HEALTH.get('clips_sent', 0),
+        'clips_failed': HEALTH.get('clips_failed', 0),
+        'clip_ring_frames': len(CLIPS.ring),
     })
 
 
@@ -2061,6 +2282,10 @@ def camera_thread(camera_manager, face_detector):
                 camera_manager.write_frame(frame)
             except Exception as e:
                 logger.error(f"camera write_frame error: {e}")
+            try:
+                CLIPS.push(frame)
+            except Exception as e:
+                logger.error(f"clip push error: {e}")
 
             t_now = time.time()
             if t_now - last_submit >= 1.0 / DETECT_RATE_HZ:
